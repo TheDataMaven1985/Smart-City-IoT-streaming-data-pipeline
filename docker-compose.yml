@@ -1,0 +1,202 @@
+version: "3.9"
+
+networks:
+  smartcity:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  minio_data:
+  grafana_data:
+  prometheus_data:
+  superset_data:
+
+    # common environment variables
+x-kafka-env: &kafka-env
+  KAFKA_BROKER_ID: 1
+  KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  KAFKA_NUM_PARTITIONS: 12
+  KAFKA_LOG_RETENTION_HOURS: 24
+  KAFKA_LOG_SEGMENT_BYTES: 107374182 # 100 MB
+  KAFKA_MESSAGE_MAX_BYTES: 10485760 # 10 MB (large batches)
+
+services:
+
+  # zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: sc_zookeeper
+    networks: [ smartcity ]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: [ "CMD", "bash", "-c", "echo ruok | nc localhost 2181" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: sc_kafka
+    networks: [ smartcity ]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092" # host-accessible listener
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    environment:
+      <<: *kafka-env
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # kafka-ui
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: sc_kafka_ui
+    networks: [ smartcity ]
+    depends_on: [ kafka ]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: smartcity
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # spark_master
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: sc_spark_master
+    networks: [ smartcity ]
+    ports:
+      - "7077:7077" # Spark master RPC
+      - "8090:8080" # Spark master Web UI (mapped to 8090 to avoid clash)
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_DAEMON_MEMORY: 1g
+
+  # spark worker
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: sc_spark_worker
+    networks: [ smartcity ]
+    depends_on: [ spark-master ]
+    ports:
+      - "8091:8081" # Worker Web UI
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES: 4
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_DAEMON_MEMORY: 1g
+
+  # minio
+  minio:
+    image: minio/minio:latest
+    container_name: sc_minio
+    networks: [ smartcity ]
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO Web Console
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+    # minio bucket initialization (runs once)
+    minio-init:
+      image: minio/mc:latest
+      container_name: sc_minio_init
+      networks: [ smartcity ]
+      depends_on:
+        minio:
+          condition: service_healthy
+      entrypoint: |
+        /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/smart-city-raw;
+        mc mb --ignore-existing local/smart-city-processed;
+        mc mb --ignore-existing local/smart-city-invalid;
+        mc mb --ignore-existing local/smart-city-aggregated;
+        echo 'Buckets ready.';
+
+    # prometheus
+    prometheus:
+      image: prom/prometheus:latest
+      container_name: sc_prometheus
+      networks: [ smartcity ]
+      ports:
+        - "9090:9090"
+      volumes:
+        - prometheus_data:/prometheus
+        - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      command:
+        - "--config.file=/etc/prometheus/prometheus.yml"
+        - "--storage.tsdb.path=/prometheus"
+        - "--storage.tsdb.retention.time=15d"
+
+    # grafana
+    grafana:
+      image: grafana/grafana:10.2.0
+      container_name: sc_grafana
+      networks: [ smartcity ]
+      depends_on: [ prometheus ]
+      ports:
+        - "3000:3000"
+      volumes:
+        - grafana_data:/var/lib/grafana
+        - ./monitoring/grafana_provisioning:/etc/grafana/provisioning:ro
+      environment:
+        GF_SECURITY_ADMIN_USER: admin
+        GF_SECURITY_ADMIN_PASSWORD: smartcity
+        GF_USERS_ALLOW_SIGN_UP: "false"
+
+    # apache superset
+    superset:
+      image: apache/superset:3.0.0
+      container_name: sc_superset
+      networks: [ smartcity ]
+      ports:
+        - "8088:8088"
+      volumes:
+        - superset_data:/app/superset_home
+      environment:
+        SUPERSET_SECRET_KEY: smart-city-superset-secret
+        SUPERSET_LOAD_EXAMPLES: "no"
+      command: >
+        bash -c " superset db upgrade && superset fab create-admin
+          --username smartcity
+          --firstname Admin
+          --lastname User
+          --email admin@smartcity.io
+          --password smartcity &&
+        superset init && gunicorn
+          --bind 0.0.0.0:8088
+          --workers 2
+          --timeout 120
+          'superset.app:create_app()'
+        "
