@@ -1,4 +1,4 @@
-kafka-python==2.0.2
+kafka-python-ng==2.2.3
 pyspark==3.5.0
 great-expectations==0.18.9
 pandas==2.1.4
